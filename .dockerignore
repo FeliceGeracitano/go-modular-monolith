@@ -1,0 +1,6 @@
+.git
+.github
+bin
+*.md
+.env*
+docker-compose.yml

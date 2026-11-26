@@ -1,0 +1,32 @@
+# Local development. `make up` starts only PostgreSQL;
+# `docker compose up --build` also builds and runs the server.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  server:
+    build: .
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/app?sslmode=disable
+      LOG_FORMAT: text
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

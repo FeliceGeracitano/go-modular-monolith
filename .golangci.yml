@@ -1,0 +1,62 @@
+# golangci-lint v2 configuration. Run with `make lint`.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose        # HTTP response bodies are closed
+    - contextcheck     # contexts are propagated, not replaced
+    - copyloopvar
+    - errorlint        # errors.Is / errors.As instead of == and type switches
+    - errname
+    - exhaustive       # switches over enums cover every case
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx            # outbound requests and queries carry a context
+    - revive
+    - rowserrcheck
+    - sloglint
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+  settings:
+    exhaustive:
+      default-signifies-exhaustive: true
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: unused-parameter
+        - name: error-return
+        - name: error-naming
+        - name: context-as-argument
+        - name: var-naming
+          arguments:
+            - []
+            - []
+            - - skip-package-name-checks: true
+    sloglint:
+      no-mixed-args: true
+      context: scope   # use the *Context variants where a ctx is in scope
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx, contextcheck, unparam]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/FeliceGeracitano/go-modular-monolith
