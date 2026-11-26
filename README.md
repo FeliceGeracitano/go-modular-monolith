@@ -1,117 +1,140 @@
 # go-modular-monolith
 
-A blueprint for building services in Go as a **modular monolith**: one binary,
-with business modules split by domain, strict boundaries between them, and
-shared functionality lifted into a small kernel and platform layer.
+A template for modular Go projects.
 
-Read [ARCHITECTURE.md](ARCHITECTURE.md) for the rules and the reasoning. This
-file is about getting it running.
+Start a new service from this repository and you get a working **modular
+monolith**: a single binary whose business code is split into modules by
+domain, with enforced boundaries between them and shared functionality lifted
+into a small common layer.
 
-## What is in the box
+The rules and the reasoning behind them are in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
-- Three example modules (`customers`, `orders`, `notifications`) showing a
-  synchronous cross-module query and an asynchronous integration event.
-- Transactional outbox, so events are never lost and never announced for a
-  rolled-back transaction.
-- One PostgreSQL schema and one migration history per module.
-- Standard library HTTP with RFC 9457 error responses, request IDs,
-  structured logging, health probes and graceful shutdown.
-- Architecture rules enforced as tests (`internal/archtest`).
-- Makefile, Dockerfile, docker compose, golangci-lint config and a CI workflow.
+## What you get
 
-Dependencies are deliberately few: `pgx`, `goose`, `uuid`, `x/sync`.
+- **Modules split by domain.** Each module keeps its internals private,
+  exposes a small contract package, and owns its database schema and
+  migrations.
+- **Shared code in one place.** `kernel` holds shared domain types;
+  `platform` holds shared infrastructure (HTTP, PostgreSQL, events, config).
+- **Two ways for modules to talk.** Direct calls through a contract, and
+  events delivered through a transactional outbox.
+- **Boundaries that are enforced.** Architecture tests fail the build when an
+  import crosses a line it should not.
+- **Production basics.** Structured logging, request IDs, consistent error
+  responses, health probes, graceful shutdown.
+- **Tooling.** Makefile, Dockerfile, docker compose, linter config, CI.
 
-## Quick start
+Three small example modules (`customers`, `orders`, `notifications`) show the
+patterns in working code. Replace them with your own.
 
-Requires Go 1.26+ and Docker.
+## Use this template
 
-```bash
-make up
-```
-
-```bash
-make run
-```
-
-The server migrates the database and listens on `:8080`. In another terminal:
-
-```bash
-curl -s -X POST localhost:8080/api/v1/customers \
-  -d '{"name":"Ada Lovelace","email":"ada@example.com"}'
-```
-
-Use the returned `id` to place an order:
-
-```bash
-curl -s -X POST localhost:8080/api/v1/orders \
-  -d '{"customer_id":"<id>","currency":"EUR","lines":[{"sku":"BOOK-1","quantity":2,"unit_price":1250}]}'
-```
-
-Within a second the server log shows `notification sent`: `orders` stored the
-order and an `OrderPlaced` event in one transaction, the outbox relay
-delivered the event, and `notifications` reacted to it.
-
-Alternatively, run everything in containers:
-
-```bash
-docker compose up --build
-```
-
-## Everyday commands
-
-| Command | What it does |
-| --- | --- |
-| `make up` / `make down` | Start PostgreSQL / stop it and delete its data |
-| `make run` | Migrate, then run the server |
-| `make migrate` | Apply migrations and exit (use this as a deploy step) |
-| `make test` | All tests with `-race`, including integration tests |
-| `make test-unit` | Only the tests that need no database |
-| `make arch` | Only the architecture rules |
-| `make lint` / `make fmt` | Lint / format |
-| `make check` | Everything CI runs |
-
-Integration tests create a throwaway database per test on the server named by
-`TEST_DATABASE_URL`, and are skipped when it is unset. Configuration is
-documented in [.env.example](.env.example).
-
-## API
-
-| Method and path | Description |
-| --- | --- |
-| `POST /api/v1/customers` | Register a customer |
-| `GET /api/v1/customers/{id}` | Fetch a customer |
-| `POST /api/v1/orders` | Place an order for an existing customer |
-| `GET /api/v1/orders/{id}` | Fetch an order |
-| `GET /healthz` | Liveness |
-| `GET /readyz` | Readiness (checks PostgreSQL) |
-
-Errors are `application/problem+json` with a stable `code`, for example
-`customers.email_taken` or `orders.unknown_customer`.
-
-## Starting a new service from this blueprint
-
-1. Create the new repository from this one (mark this repository as a
-   template in its GitHub settings, then "Use this template"), or copy the
-   files.
+1. Create your repository from this one (**Use this template** on GitHub, or
+   copy the files).
 2. Rename the Go module:
 
    ```bash
    scripts/rename-module.sh github.com/your-org/your-service
    ```
 
-3. Delete the example modules under `internal/modules/` and their wiring in
-   `internal/bootstrap/app.go`, then add your own following
-   [the recipes](ARCHITECTURE.md#9-recipes).
-4. Keep `internal/kernel`, `internal/platform`, `internal/archtest` and
-   `ARCHITECTURE.md`, and evolve them with the service.
+3. Remove the example modules from `internal/modules/` and their wiring in
+   `internal/bootstrap/app.go`.
+4. Add your own modules by following the
+   [recipes](ARCHITECTURE.md#9-recipes).
 
-## Layout
+Keep `internal/kernel`, `internal/platform`, `internal/archtest` and
+`ARCHITECTURE.md`, and evolve them with your service.
+
+## Run it
+
+Requires Go 1.26+ and Docker.
+
+Start PostgreSQL:
+
+```bash
+make up
+```
+
+Migrate the database and start the server on `:8080`:
+
+```bash
+make run
+```
+
+Try it from another terminal. Register a customer:
+
+```bash
+curl -s -X POST localhost:8080/api/v1/customers \
+  -d '{"name":"Ada Lovelace","email":"ada@example.com"}'
+```
+
+Place an order, using the `id` from the response:
+
+```bash
+curl -s -X POST localhost:8080/api/v1/orders \
+  -d '{"customer_id":"<id>","currency":"EUR","lines":[{"sku":"BOOK-1","quantity":2,"unit_price":1250}]}'
+```
+
+The server log then shows `notification sent`: the `orders` module published
+an event and the `notifications` module reacted to it.
+
+## Project layout
 
 ```text
-cmd/server/          entry point
-internal/bootstrap/  composition root: the only code that sees every module
-internal/kernel/     shared domain vocabulary (pure)
-internal/platform/   shared technical capabilities (HTTP, Postgres, events, config)
-internal/modules/    business modules, one directory per domain
-internal/archtest/   the architecture rules, as tests
+cmd/server/            entry point
+internal/
+  bootstrap/           wires everything together; the only code that sees every module
+  kernel/              shared domain types (errors, IDs, money, clock)
+  platform/            shared infrastructure (HTTP, PostgreSQL, events, config)
+  modules/             business modules, one directory per domain
+    customers/
+    orders/
+    notifications/
+  archtest/            the architecture rules, as tests
 ```
+
+Inside a module:
+
+```text
+modules/orders/
+  module.go            wiring
+  ordersapi/           public contract: the only package other modules may import
+  migrations/          SQL for the module's own schema
+  internal/            private to the module
+    domain/            business rules
+    app/               use cases
+    adapters/          HTTP handlers, repositories, clients
+```
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `make up` | Start PostgreSQL |
+| `make down` | Stop PostgreSQL and delete its data |
+| `make run` | Migrate, then run the server |
+| `make migrate` | Apply migrations and exit |
+| `make test` | Run all tests (needs `make up`) |
+| `make test-unit` | Run the tests that need no database |
+| `make arch` | Check the architecture rules |
+| `make lint` | Run the linters |
+| `make fmt` | Format the code |
+| `make check` | Run everything CI runs |
+
+## Configuration
+
+The server is configured through environment variables. Only `DATABASE_URL`
+is required; every setting and its default is listed in
+[.env.example](.env.example).
+
+## Example API
+
+| Endpoint | Description |
+| --- | --- |
+| `POST /api/v1/customers` | Register a customer |
+| `GET /api/v1/customers/{id}` | Fetch a customer |
+| `POST /api/v1/orders` | Place an order |
+| `GET /api/v1/orders/{id}` | Fetch an order |
+| `GET /healthz` | Liveness probe |
+| `GET /readyz` | Readiness probe |
