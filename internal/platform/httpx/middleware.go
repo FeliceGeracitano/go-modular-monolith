@@ -76,7 +76,17 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 // Unwrap lets http.ResponseController reach the underlying writer.
 func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
-// AccessLog logs one line per request.
+// statusOrOK returns the recorded status. A handler that wrote nothing
+// implicitly answered 200.
+func (s *statusRecorder) statusOrOK() int {
+	if s.status == 0 {
+		return http.StatusOK
+	}
+	return s.status
+}
+
+// AccessLog logs one line per request. Probe requests are logged at debug
+// level: they arrive every few seconds and say nothing new.
 func AccessLog(logger *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -85,16 +95,17 @@ func AccessLog(logger *slog.Logger) Middleware {
 
 			next.ServeHTTP(rec, r)
 
-			if rec.status == 0 {
-				rec.status = http.StatusOK
+			level := slog.LevelInfo
+			if isProbe(r) {
+				level = slog.LevelDebug
 			}
 			// r.Pattern is the matched route ("GET /api/v1/orders/{id}"),
 			// which keeps log cardinality bounded.
-			logging.FromContext(r.Context(), logger).InfoContext(r.Context(), "http request",
+			logging.FromContext(r.Context(), logger).Log(r.Context(), level, "http request",
 				"method", r.Method,
 				"path", r.URL.Path,
 				"route", r.Pattern,
-				"status", rec.status,
+				"status", rec.statusOrOK(),
 				"duration_ms", time.Since(start).Milliseconds(),
 			)
 		})

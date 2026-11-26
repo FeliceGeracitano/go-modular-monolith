@@ -4,6 +4,10 @@
 // Dependency injection is done by hand, with constructors. There is no
 // container and no reflection: the wiring is ordinary code that the compiler
 // checks and that you can read top to bottom.
+//
+//   - app.go      builds the platform and runs the process
+//   - modules.go  constructs the business modules (the dependency graph)
+//   - main.go     the shared entry point of the binaries under cmd/
 package bootstrap
 
 import (
@@ -15,9 +19,6 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/FeliceGeracitano/go-modular-monolith/internal/kernel/clock"
-	"github.com/FeliceGeracitano/go-modular-monolith/internal/modules/customers"
-	"github.com/FeliceGeracitano/go-modular-monolith/internal/modules/notifications"
-	"github.com/FeliceGeracitano/go-modular-monolith/internal/modules/orders"
 	"github.com/FeliceGeracitano/go-modular-monolith/internal/platform/config"
 	"github.com/FeliceGeracitano/go-modular-monolith/internal/platform/eventbus"
 	"github.com/FeliceGeracitano/go-modular-monolith/internal/platform/httpx"
@@ -26,90 +27,148 @@ import (
 	"github.com/FeliceGeracitano/go-modular-monolith/internal/platform/postgres"
 )
 
+// Roles selects what a process does. Every process contains every module;
+// roles decide which inbound adapters are switched on, so the same code can
+// run as one process or be split to scale request handling and background
+// work independently.
+type Roles struct {
+	// API serves the modules' HTTP endpoints.
+	API bool
+	// Worker relays the outbox and runs the modules' event subscribers.
+	Worker bool
+}
+
+// platform is the shared infrastructure handed to modules.go.
+type platform struct {
+	cfg    config.Config
+	logger *slog.Logger
+	clock  clock.Clock
+	// events stores integration events atomically with the caller's
+	// transaction (the transactional outbox).
+	events *outbox.Publisher
+
+	admin  *postgres.DB
+	scoped []*postgres.DB
+}
+
+// moduleDB returns a database handle restricted to the named module's own
+// schema. Every module gets its own; none gets the administrative one.
+func (p *platform) moduleDB(name string) (*postgres.DB, error) {
+	db, err := p.admin.Scoped(name)
+	if err != nil {
+		return nil, err
+	}
+	p.scoped = append(p.scoped, db)
+	return db, nil
+}
+
+func (p *platform) close() {
+	for _, db := range p.scoped {
+		db.Close()
+	}
+	p.admin.Close()
+}
+
 // App is the assembled application.
 type App struct {
-	cfg     config.Config
-	logger  *slog.Logger
-	db      *postgres.DB
-	modules []module.Module
-	relay   *outbox.Relay
-	handler http.Handler
+	platform *platform
+	roles    Roles
+	modules  []module.Module
+	relay    *outbox.Relay
+	handler  http.Handler
 }
 
 // New connects to the infrastructure and assembles every module. The caller
 // must Close the returned App.
-func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*App, error) {
-	db, err := postgres.Open(ctx, cfg.Postgres.URL, cfg.Postgres.MaxConns)
+func New(ctx context.Context, cfg config.Config, logger *slog.Logger, roles Roles) (_ *App, err error) {
+	admin, err := postgres.Open(ctx, cfg.Postgres.URL, cfg.Postgres.MaxConns)
 	if err != nil {
 		return nil, err
 	}
-
-	// Shared infrastructure.
 	clk := clock.System{}
-	bus := eventbus.New()
-	events := outbox.NewPublisher(db, clk)
+	p := &platform{
+		cfg:    cfg,
+		logger: logger,
+		clock:  clk,
+		events: outbox.NewPublisher(clk),
+		admin:  admin,
+	}
+	defer func() {
+		if err != nil {
+			p.close()
+		}
+	}()
 
-	// Modules. This block is the system's dependency graph: a module that
-	// needs another one receives its public API here, explicitly.
-	customersModule := customers.New(customers.Deps{
-		DB:    db,
-		Clock: clk,
-	})
-	ordersModule := orders.New(orders.Deps{
-		DB:        db,
-		Clock:     clk,
-		Events:    events,
-		Customers: customersModule.API(),
-	})
-	notificationsModule := notifications.New(notifications.Deps{
-		DB:        db,
-		Clock:     clk,
-		Logger:    logger,
-		Customers: customersModule.API(),
-	})
-	modules := []module.Module{customersModule, ordersModule, notificationsModule}
-
-	// Inbound adapters.
-	mux := http.NewServeMux()
-	httpx.RegisterHealth(mux, map[string]httpx.Check{"postgres": db.Ping})
+	modules, err := p.modules()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(modules))
 	for _, m := range modules {
-		m.RegisterRoutes(mux)
-		m.RegisterSubscribers(bus)
+		if seen[m.Name()] {
+			return nil, fmt.Errorf("bootstrap: module %q is registered twice", m.Name())
+		}
+		seen[m.Name()] = true
 	}
 
-	return &App{
-		cfg:     cfg,
-		logger:  logger,
-		db:      db,
-		modules: modules,
-		relay: outbox.NewRelay(db, bus, logger, outbox.RelayConfig{
-			PollInterval: cfg.Outbox.PollInterval,
-			BatchSize:    cfg.Outbox.BatchSize,
-			MaxAttempts:  cfg.Outbox.MaxAttempts,
-		}),
+	// Inbound adapters, switched on by role. Probes are always served, so
+	// an orchestrator can supervise workers the same way as API processes.
+	mux := http.NewServeMux()
+	httpx.RegisterHealth(mux, map[string]httpx.Check{"postgres": admin.Ping})
+	if roles.API {
+		for _, m := range modules {
+			m.RegisterRoutes(mux)
+		}
+	}
+
+	app := &App{
+		platform: p,
+		roles:    roles,
+		modules:  modules,
 		handler: httpx.Chain(mux,
 			httpx.RequestID(logger),
+			httpx.Telemetry(),
 			httpx.AccessLog(logger),
 			httpx.Recover(logger),
 		),
-	}, nil
+	}
+
+	if roles.Worker {
+		bus := eventbus.New()
+		for _, m := range modules {
+			m.RegisterSubscribers(bus)
+		}
+		relayDB, err := p.moduleDB(outbox.Schema)
+		if err != nil {
+			return nil, err
+		}
+		app.relay = outbox.NewRelay(relayDB, bus, logger, outbox.RelayConfig{
+			PollInterval: cfg.Outbox.PollInterval,
+			BatchSize:    cfg.Outbox.BatchSize,
+			MaxAttempts:  cfg.Outbox.MaxAttempts,
+		})
+	}
+	return app, nil
 }
 
 // Close releases the application's resources.
-func (a *App) Close() { a.db.Close() }
+func (a *App) Close() { a.platform.close() }
 
 // Handler returns the fully assembled HTTP handler. Tests drive the
 // application through it without opening a socket.
 func (a *App) Handler() http.Handler { return a.handler }
 
-// Relay returns the outbox relay, so tests can deliver events
-// deterministically instead of waiting for the poller.
+// Relay returns the outbox relay, or nil when the process has no Worker
+// role. Tests use it to deliver events deterministically instead of waiting
+// for the poller.
 func (a *App) Relay() *outbox.Relay { return a.relay }
 
 // Migrate brings every schema up to date: the platform's first, then each
 // module's own.
 func (a *App) Migrate(ctx context.Context) error {
-	if err := postgres.Migrate(ctx, a.db, outbox.Schema, outbox.Migrations()); err != nil {
+	admin, logger := a.platform.admin, a.platform.logger
+
+	if err := postgres.Migrate(ctx, admin, outbox.Schema, outbox.Migrations()); err != nil {
 		return err
 	}
 	for _, m := range a.modules {
@@ -117,31 +176,35 @@ func (a *App) Migrate(ctx context.Context) error {
 		if migrations == nil {
 			continue
 		}
-		if err := postgres.Migrate(ctx, a.db, m.Name(), migrations); err != nil {
+		if err := postgres.Migrate(ctx, admin, m.Name(), migrations); err != nil {
 			return fmt.Errorf("module %s: %w", m.Name(), err)
 		}
-		a.logger.InfoContext(ctx, "migrations applied", "module", m.Name())
+		logger.InfoContext(ctx, "migrations applied", "module", m.Name())
 	}
 	return nil
 }
 
-// Run serves HTTP and relays events until ctx is cancelled or one of the
-// two fails, then shuts both down gracefully.
+// Run serves until ctx is cancelled or a component fails, then shuts
+// everything down gracefully.
 func (a *App) Run(ctx context.Context) error {
+	cfg, logger := a.platform.cfg, a.platform.logger
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		a.logger.InfoContext(ctx, "http server listening", "addr", a.cfg.HTTP.Addr)
+		logger.InfoContext(ctx, "http server listening",
+			"addr", cfg.HTTP.Addr, "api", a.roles.API, "worker", a.roles.Worker)
 		return httpx.Serve(ctx, httpx.ServerConfig{
-			Addr:            a.cfg.HTTP.Addr,
-			ReadTimeout:     a.cfg.HTTP.ReadTimeout,
-			WriteTimeout:    a.cfg.HTTP.WriteTimeout,
-			ShutdownTimeout: a.cfg.HTTP.ShutdownTimeout,
+			Addr:            cfg.HTTP.Addr,
+			ReadTimeout:     cfg.HTTP.ReadTimeout,
+			WriteTimeout:    cfg.HTTP.WriteTimeout,
+			ShutdownTimeout: cfg.HTTP.ShutdownTimeout,
 		}, a.handler)
 	})
-	g.Go(func() error {
-		return a.relay.Run(ctx)
-	})
+	if a.relay != nil {
+		g.Go(func() error {
+			return a.relay.Run(ctx)
+		})
+	}
 
 	return g.Wait()
 }

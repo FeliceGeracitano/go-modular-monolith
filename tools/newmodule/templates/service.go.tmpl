@@ -1,0 +1,41 @@
+// Package app holds the {{.Name}} module's use cases. It talks to the
+// outside world only through the ports declared here; adapters implement
+// them. Add an internal/domain package when business rules appear that are
+// worth isolating from orchestration.
+package app
+
+import (
+	"context"
+	"fmt"
+)
+
+// Store is the persistence port. Replace Ping with the operations your use
+// cases need.
+type Store interface {
+	Ping(ctx context.Context) error
+}
+
+// Service implements the {{.Name}} use cases.
+type Service struct {
+	store Store
+}
+
+// NewService wires a Service.
+func NewService(store Store) *Service {
+	return &Service{store: store}
+}
+
+// Status is the result of Service.Status.
+type Status struct {
+	Module string
+}
+
+// Status reports that the module is wired up and can reach its storage. It
+// exists to prove the new module works end to end: replace it with your
+// first real use case.
+func (s *Service) Status(ctx context.Context) (Status, error) {
+	if err := s.store.Ping(ctx); err != nil {
+		return Status{}, fmt.Errorf("{{.Name}}: storage: %w", err)
+	}
+	return Status{Module: "{{.Name}}"}, nil
+}

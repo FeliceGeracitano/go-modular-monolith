@@ -1,0 +1,18 @@
+# Who reviews what. The last matching line wins.
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything not claimed below.
+*                                   @FeliceGeracitano
+
+# Shared code and the rules: a change here affects every module.
+/internal/kernel/                   @FeliceGeracitano
+/internal/platform/                 @FeliceGeracitano
+/internal/archtest/                 @FeliceGeracitano
+/ARCHITECTURE.md                    @FeliceGeracitano
+/docs/adr/                          @FeliceGeracitano
+
+# Business modules: one line each. The architecture tests fail for a module
+# without one, and `make module` adds it for you.
+/internal/modules/customers/        @FeliceGeracitano
+/internal/modules/notifications/    @FeliceGeracitano
+/internal/modules/orders/           @FeliceGeracitano

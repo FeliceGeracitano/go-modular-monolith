@@ -1,0 +1,4 @@
+{
+  "description": "Places orders for existing customers and announces them.",
+  "uses": ["customers"]
+}

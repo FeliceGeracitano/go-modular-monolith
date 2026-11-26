@@ -20,6 +20,13 @@ import (
 	"log/slog"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/FeliceGeracitano/go-modular-monolith/internal/kernel/clock"
 	"github.com/FeliceGeracitano/go-modular-monolith/internal/kernel/event"
 	"github.com/FeliceGeracitano/go-modular-monolith/internal/kernel/id"
@@ -29,6 +36,8 @@ import (
 
 // Schema is the database schema owned by the outbox.
 const Schema = "outbox"
+
+const instrumentationName = "platform/outbox"
 
 //go:embed migrations/*.sql
 var migrations embed.FS
@@ -49,31 +58,45 @@ var ErrNoTransaction = errors.New("outbox: publish must be called within a trans
 
 // Publisher stores events in the outbox. It satisfies the event publisher
 // port that modules declare in their application layer.
+//
+// It holds no database handle: it writes through the transaction the caller
+// already opened, whichever module's connection that is.
 type Publisher struct {
-	db    *postgres.DB
 	clock clock.Clock
 }
 
-// NewPublisher returns a Publisher writing to db.
-func NewPublisher(db *postgres.DB, clk clock.Clock) *Publisher {
-	return &Publisher{db: db, clock: clk}
+// NewPublisher returns a Publisher.
+func NewPublisher(clk clock.Clock) *Publisher {
+	return &Publisher{clock: clk}
 }
 
 // Publish records events as part of the transaction carried by ctx.
 func (p *Publisher) Publish(ctx context.Context, events ...event.Event) error {
-	if !postgres.InTx(ctx) {
+	tx, ok := postgres.TxFrom(ctx)
+	if !ok {
 		return ErrNoTransaction
 	}
+
+	// Carry the publisher's trace context with the event, so the handlers
+	// that eventually run show up in the same trace as the request that
+	// caused them.
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	headers, err := json.Marshal(carrier)
+	if err != nil {
+		return fmt.Errorf("outbox: encode headers: %w", err)
+	}
+
 	now := p.clock.Now()
 	for _, evt := range events {
 		payload, err := json.Marshal(evt)
 		if err != nil {
 			return fmt.Errorf("outbox: encode %s: %w", evt.EventName(), err)
 		}
-		_, err = p.db.Conn(ctx).Exec(ctx, `
-			INSERT INTO outbox.messages (id, name, payload, occurred_at, available_at)
-			VALUES ($1, $2, $3, $4, $4)`,
-			id.New(), evt.EventName(), payload, now)
+		_, err = tx.Exec(ctx, `
+			INSERT INTO outbox.messages (id, name, payload, headers, occurred_at, available_at)
+			VALUES ($1, $2, $3, $4, $5, $5)`,
+			id.New(), evt.EventName(), payload, headers, now)
 		if err != nil {
 			return fmt.Errorf("outbox: store %s: %w", evt.EventName(), err)
 		}
@@ -104,6 +127,8 @@ type Relay struct {
 	dispatcher Dispatcher
 	logger     *slog.Logger
 	cfg        RelayConfig
+	tracer     trace.Tracer
+	deliveries metric.Int64Counter
 }
 
 // NewRelay returns a Relay. Several relays (one per process instance) may
@@ -118,37 +143,70 @@ func NewRelay(db *postgres.DB, dispatcher Dispatcher, logger *slog.Logger, cfg R
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 10
 	}
-	return &Relay{db: db, dispatcher: dispatcher, logger: logger, cfg: cfg}
+	// A failed registration yields a no-op counter: telemetry must never
+	// stop events from flowing.
+	deliveries, _ := otel.Meter(instrumentationName).Int64Counter(
+		"outbox.deliveries",
+		metric.WithDescription("Outbox delivery attempts, by event and outcome."),
+	)
+	return &Relay{
+		db:         db,
+		dispatcher: dispatcher,
+		logger:     logger,
+		cfg:        cfg,
+		tracer:     otel.Tracer(instrumentationName),
+		deliveries: deliveries,
+	}
 }
 
-// Run polls until ctx is cancelled. It always returns nil on cancellation so
-// it composes with errgroup-style supervisors.
+// Run polls until ctx is cancelled. It always returns nil, so it composes
+// with errgroup-style supervisors: a failing database is retried, not fatal.
 func (r *Relay) Run(ctx context.Context) error {
-	ticker := time.NewTicker(r.cfg.PollInterval)
-	defer ticker.Stop()
-
+	failures := 0
 	for {
-		// Drain: keep going while batches come back full.
-		for {
-			n, err := r.ProcessBatch(ctx)
-			if err != nil && ctx.Err() == nil {
-				r.logger.ErrorContext(ctx, "outbox relay batch failed", "error", err)
-			}
-			if err != nil || n < r.cfg.BatchSize {
-				break
-			}
-		}
+		wait := r.poll(ctx, &failures)
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-time.After(wait):
 		}
 	}
 }
 
+// poll drains the outbox once and returns how long to wait before the next
+// poll. failures counts consecutive failed polls.
+func (r *Relay) poll(ctx context.Context, failures *int) time.Duration {
+	// Drain: keep going while batches come back full.
+	var err error
+	for {
+		var n int
+		n, err = r.ProcessBatch(ctx)
+		if err != nil || n < r.cfg.BatchSize {
+			break
+		}
+	}
+	if err == nil || ctx.Err() != nil {
+		*failures = 0
+		return r.cfg.PollInterval
+	}
+
+	// The database is unreachable or not migrated. Keep trying, but back
+	// off so an outage is not also a flood of logs and load.
+	*failures++
+	wait := min(r.cfg.PollInterval<<min(*failures, 10), maxPollBackoff)
+	r.logger.ErrorContext(ctx, "outbox relay batch failed",
+		"error", err, "consecutive_failures", *failures, "retry_in", wait.String())
+	return wait
+}
+
+// maxPollBackoff bounds how long the relay waits between attempts while the
+// database is failing.
+const maxPollBackoff = 30 * time.Second
+
 type message struct {
 	seq      int64
 	attempts int
+	headers  []byte
 	env      eventbus.Envelope
 }
 
@@ -160,7 +218,7 @@ func (r *Relay) ProcessBatch(ctx context.Context) (int, error) {
 		conn := r.db.Conn(txCtx)
 
 		rows, err := conn.Query(txCtx, `
-			SELECT seq, id::text, name, payload, occurred_at, attempts
+			SELECT seq, id::text, name, payload, headers, occurred_at, attempts
 			FROM outbox.messages
 			WHERE processed_at IS NULL AND attempts < $1 AND available_at <= now()
 			ORDER BY seq
@@ -172,7 +230,7 @@ func (r *Relay) ProcessBatch(ctx context.Context) (int, error) {
 		var batch []message
 		for rows.Next() {
 			var m message
-			if err := rows.Scan(&m.seq, &m.env.ID, &m.env.Name, &m.env.Payload, &m.env.OccurredAt, &m.attempts); err != nil {
+			if err := rows.Scan(&m.seq, &m.env.ID, &m.env.Name, &m.env.Payload, &m.headers, &m.env.OccurredAt, &m.attempts); err != nil {
 				rows.Close()
 				return fmt.Errorf("outbox: scan: %w", err)
 			}
@@ -186,7 +244,7 @@ func (r *Relay) ProcessBatch(ctx context.Context) (int, error) {
 		for _, m := range batch {
 			// Handlers get the caller's context, not txCtx: they manage
 			// their own transactions and must not join the relay's.
-			dispatchErr := r.dispatcher.Dispatch(ctx, m.env)
+			dispatchErr := r.deliver(ctx, m)
 			if err := r.record(txCtx, conn, m, dispatchErr); err != nil {
 				return err
 			}
@@ -195,6 +253,38 @@ func (r *Relay) ProcessBatch(ctx context.Context) (int, error) {
 		return nil
 	})
 	return handled, err
+}
+
+// deliver dispatches one message inside a span that continues the
+// publisher's trace.
+func (r *Relay) deliver(ctx context.Context, m message) error {
+	carrier := propagation.MapCarrier{}
+	_ = json.Unmarshal(m.headers, &carrier) // headers are best-effort metadata
+
+	ctx = otel.GetTextMapPropagator().Extract(ctx, carrier)
+	ctx, span := r.tracer.Start(ctx, "deliver "+m.env.Name,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "outbox"),
+			attribute.String("messaging.operation.type", "process"),
+			attribute.String("messaging.destination.name", m.env.Name),
+			attribute.String("messaging.message.id", m.env.ID),
+		))
+	defer span.End()
+
+	err := r.dispatcher.Dispatch(ctx, m.env)
+
+	outcome := "delivered"
+	if err != nil {
+		outcome = "failed"
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "delivery failed")
+	}
+	r.deliveries.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("event", m.env.Name),
+		attribute.String("outcome", outcome),
+	))
+	return err
 }
 
 func (r *Relay) record(ctx context.Context, conn postgres.Querier, m message, dispatchErr error) error {

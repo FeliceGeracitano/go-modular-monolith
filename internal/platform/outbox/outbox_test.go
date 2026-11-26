@@ -32,13 +32,20 @@ func newHarness(t *testing.T) *harness {
 	if err := postgres.Migrate(context.Background(), db, outbox.Schema, outbox.Migrations()); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
+	// The relay runs with the outbox's own restricted role, as in production.
+	relayDB, err := db.Scoped(outbox.Schema)
+	if err != nil {
+		t.Fatalf("scoped: %v", err)
+	}
+	t.Cleanup(relayDB.Close)
+
 	bus := eventbus.New()
 	logger := slog.New(slog.DiscardHandler)
 	return &harness{
 		db:        db,
 		bus:       bus,
-		publisher: outbox.NewPublisher(db, clock.System{}),
-		relay:     outbox.NewRelay(db, bus, logger, outbox.RelayConfig{MaxAttempts: 2}),
+		publisher: outbox.NewPublisher(clock.System{}),
+		relay:     outbox.NewRelay(relayDB, bus, logger, outbox.RelayConfig{MaxAttempts: 2}),
 	}
 }
 

@@ -11,14 +11,40 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/FeliceGeracitano/go-modular-monolith/internal/platform/buildinfo"
+)
+
+// Environments the service can run in. The same binary and image run in
+// all of them; only configuration differs.
+const (
+	EnvLocal      = "local"
+	EnvDev        = "dev"
+	EnvStaging    = "staging"
+	EnvProduction = "production"
 )
 
 // Config is the full process configuration.
 type Config struct {
-	HTTP     HTTP
-	Postgres Postgres
-	Log      Log
-	Outbox   Outbox
+	// Env names the environment this process runs in. It labels logs and
+	// telemetry and picks a few defaults; it must never switch business
+	// behaviour on or off (use an explicit setting for that).
+	Env string
+	// Service is the name this process reports in logs and telemetry.
+	Service   string
+	HTTP      HTTP
+	Postgres  Postgres
+	Log       Log
+	Outbox    Outbox
+	Telemetry Telemetry
+}
+
+// Telemetry configures trace and metric export.
+type Telemetry struct {
+	// Enabled is true when an OTLP endpoint is configured. Everything else
+	// about export is read by the OpenTelemetry SDK from the standard
+	// OTEL_* variables.
+	Enabled bool
 }
 
 // HTTP configures the HTTP server.
@@ -58,7 +84,16 @@ func Load() (Config, error) {
 func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 	l := loader{lookup: lookup}
 
+	env := l.oneOf("APP_ENV", EnvLocal, EnvLocal, EnvDev, EnvStaging, EnvProduction)
+	// Humans read local logs; machines read everything else.
+	logFormat := "json"
+	if env == EnvLocal {
+		logFormat = "text"
+	}
+
 	cfg := Config{
+		Env:     env,
+		Service: l.str("SERVICE_NAME", buildinfo.Service()),
 		HTTP: HTTP{
 			Addr:            l.str("HTTP_ADDR", ":8080"),
 			ReadTimeout:     l.duration("HTTP_READ_TIMEOUT", 10*time.Second),
@@ -71,12 +106,15 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		},
 		Log: Log{
 			Level:  l.level("LOG_LEVEL", slog.LevelInfo),
-			Format: l.oneOf("LOG_FORMAT", "json", "json", "text"),
+			Format: l.oneOf("LOG_FORMAT", logFormat, "json", "text"),
 		},
 		Outbox: Outbox{
 			PollInterval: l.duration("OUTBOX_POLL_INTERVAL", time.Second),
 			BatchSize:    l.integer("OUTBOX_BATCH_SIZE", 50, 1, 1000),
 			MaxAttempts:  l.integer("OUTBOX_MAX_ATTEMPTS", 10, 1, 1000),
+		},
+		Telemetry: Telemetry{
+			Enabled: l.str("OTEL_EXPORTER_OTLP_ENDPOINT", "") != "" && l.str("OTEL_SDK_DISABLED", "") != "true",
 		},
 	}
 	return cfg, errors.Join(l.errs...)
