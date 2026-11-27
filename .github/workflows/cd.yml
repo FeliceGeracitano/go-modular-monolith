@@ -33,18 +33,18 @@ jobs:
     outputs:
       ref: ${{ steps.ref.outputs.ref }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -53,7 +53,7 @@ jobs:
             type=semver,pattern={{version}}
 
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: dev
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/deploy.sh dev "${{ needs.image.outputs.ref }}"
 
   deploy-staging:
@@ -90,7 +90,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/deploy.sh staging "${{ needs.image.outputs.ref }}"
 
   deploy-production:
@@ -100,5 +100,5 @@ jobs:
     # Add required reviewers to this environment to make promotion a decision.
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: scripts/deploy.sh production "${{ needs.image.outputs.ref }}"
