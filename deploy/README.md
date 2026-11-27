@@ -7,7 +7,7 @@ promoted through every environment. Only configuration differs.
 
 | Environment | Deployed from | Purpose |
 | --- | --- | --- |
-| `local` | your machine | Development. `make up && make run`. |
+| `local` | your machine | Development. `make run`. |
 | `dev` | every push to `main` | Integration; always the latest `main`. |
 | `staging` | a version tag (`v1.2.3`) | Release candidate, production-like. |
 | `production` | the same tag, after staging | Live. Protect it with required reviewers. |
@@ -18,21 +18,15 @@ Configuration is environment variables only, validated at startup.
 
 - **Non-secret settings** live in [`env/`](env/), one file per environment,
   reviewed like code. A test checks that every file is a valid configuration.
-- **Secrets** (`DATABASE_URL`, `OTEL_EXPORTER_OTLP_HEADERS`, API keys) never
-  enter the repository. Store them in your platform's secret manager or in
-  the matching GitHub environment, and inject them at deploy time.
+- **Secrets** (`OTEL_EXPORTER_OTLP_HEADERS`, API keys, future data-store
+  credentials) never enter the repository. Store them in your platform's
+  secret manager or in the matching GitHub environment, and inject them at
+  deploy time.
 
-## Processes
+## Process
 
-| Binary | Role | Notes |
-| --- | --- | --- |
-| `/app/migrate` | Applies migrations, then exits | Run once per release, before the others. Needs a database user allowed to create roles. |
-| `/app/api` | HTTP API | Scale on request load. |
-| `/app/worker` | Event delivery | Scale on outbox backlog. |
-| `/app/server` | All of the above in one process | The image's default; fine until you need to scale them apart. |
-
-Every process serves `/healthz` (liveness) and `/readyz` (readiness) on
-`HTTP_ADDR`, and shuts down gracefully on `SIGTERM`.
+The container image runs `/app/server`, which serves `/healthz` (liveness) and
+`/readyz` (readiness) on `HTTP_ADDR`, and shuts down gracefully on `SIGTERM`.
 
 ## Pipeline
 

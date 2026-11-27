@@ -1,25 +1,9 @@
-# Local development only.
+# Optional local Docker services. The Go service itself runs with zero
+# external dependencies (`make run`).
 #
-#   make up                  PostgreSQL
-#   make up-observability    PostgreSQL + Grafana (traces, metrics) on :3000
+#   make up-observability                      Grafana + OTLP collector on :3000 / :4318
 #   docker compose --profile app up --build    the service itself, in a container
 services:
-  postgres:
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app
-      POSTGRES_DB: app
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d app"]
-      interval: 2s
-      timeout: 2s
-      retries: 20
-
   # An all-in-one OpenTelemetry backend: OTLP in on :4318, Grafana on :3000.
   # Point the service at it with OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
   observability:
@@ -37,12 +21,5 @@ services:
     profiles: [app]
     environment:
       APP_ENV: local
-      DATABASE_URL: postgres://app:app@postgres:5432/app?sslmode=disable
     ports:
       - "8080:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-volumes:
-  postgres-data:
