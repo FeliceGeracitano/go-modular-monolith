@@ -1,0 +1,4 @@
+{
+  "description": "Tells customers about things that happened elsewhere, such as a placed order.",
+  "uses": ["customers", "orders"]
+}

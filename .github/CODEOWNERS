@@ -1,0 +1,14 @@
+# Default owner for everything not claimed below.
+*                                   @FeliceGeracitano
+
+# Shared code and architecture rules.
+/pkg/                               @FeliceGeracitano
+/test/arch/                         @FeliceGeracitano
+/ARCHITECTURE.md                    @FeliceGeracitano
+
+# Business modules: one line each (verified by test/arch).
+/modules/cart/                      @FeliceGeracitano
+/modules/customers/                 @FeliceGeracitano
+/modules/notifications/             @FeliceGeracitano
+/modules/orders/                    @FeliceGeracitano
+/modules/products/                  @FeliceGeracitano

@@ -1,0 +1,25 @@
+# Optional local Docker services. The Go service itself runs with zero
+# external dependencies (`make run`).
+#
+#   make up-observability                      Grafana + OTLP collector on :3000 / :4318
+#   docker compose --profile app up --build    the service itself, in a container
+services:
+  # An all-in-one OpenTelemetry backend: OTLP in on :4318, Grafana on :3000.
+  # Point the service at it with OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+  observability:
+    image: grafana/otel-lgtm:0.41.1
+    profiles: [observability]
+    ports:
+      - "3000:3000"
+      - "4318:4318"
+
+  server:
+    build:
+      context: .
+      args:
+        VERSION: local
+    profiles: [app]
+    environment:
+      APP_ENV: local
+    ports:
+      - "8080:8080"

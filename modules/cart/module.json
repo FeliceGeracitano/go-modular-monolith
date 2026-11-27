@@ -1,0 +1,4 @@
+{
+  "description": "Manages per-customer shopping carts and clears them when an order is placed.",
+  "uses": ["customers", "orders", "products"]
+}
